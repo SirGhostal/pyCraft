@@ -4,7 +4,7 @@ from minecraft.networking.packets import (
 
 from minecraft.networking.types import (
     Double, Float, Boolean, VarInt, String, Byte, UnsignedByte, Position, Enum,
-    RelativeHand, BlockFace
+    RelativeHand, BlockFace, ClickType
 )
 
 from .client_settings_packet import ClientSettingsPacket
@@ -22,6 +22,7 @@ def get_packets(context):
         PluginMessagePacket,
         PlayerBlockPlacementPacket,
         BlockActionPacket,
+        UseEntityPacket
     }
     if context.protocol_version >= 69:
         packets |= {
@@ -253,10 +254,48 @@ class BlockActionPacket(Packet):
     get_definition = staticmethod(lambda context: [
         {'location': Position},
         {'block_type': VarInt} if context.protocol_version == 347 else {},
-        {'action_id': UnsignedByte},     # TODO Be able to interpret these values.
+        {'action_id': UnsignedByte},     # TODO Interpret these values.
         {'action_param': UnsignedByte},  # Same here
         {'block_type': VarInt} if context.protocol_version != 347 else {},
     ])
 
 
+class UseEntityPacket(Packet):
+    @staticmethod
+    def get_id(context):
+        return 0x0E if context.protocol_version >= 464 else \
+               0x0D if context.protocol_version >= 389 else \
+               0x0B if context.protocol_version >= 386 else \
+               0x0A if context.protocol_version >= 345 else \
+               0x09 if context.protocol_version >= 343 else \
+               0x0A if context.protocol_version >= 336 else \
+               0x0B if context.protocol_version >= 318 else \
+               0x0A if context.protocol_version >= 94 else \
+               0x09 if context.protocol_version >= 70 else \
+               0x02
 
+    packet_name = "use entity"
+
+    def read(self, file_object):
+        self.target = VarInt.read(file_object)
+        self.type = VarInt.read(file_object)
+        if self.type is ClickType.INTERACT_AT:
+            self.target_x  =Float.read(file_object)
+            self.target_y = Float.read(file_object)
+            self.target_z = Float.read(file_object)
+        if self.type in [ClickType.INTERACT_AT, ClickType.INTERACT]:
+            self.hand = VarInt.read(file_object)
+
+    def write_fields(self, packet_buffer):
+        VarInt.send(self.target, packet_buffer)
+        VarInt.send(self.type, packet_buffer)
+        if self.type is ClickType.INTERACT_AT:
+            Float.send(self.target_x, packet_buffer)
+            Float.send(self.target_y, packet_buffer)
+            Float.send(self.target_z, packet_buffer)
+        if self.type in [ClickType.INTERACT_AT, ClickType.INTERACT]:
+            VarInt.send(self.hand)
+
+    ClickType = ClickType
+
+    Hand = RelativeHand
