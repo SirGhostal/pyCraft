@@ -3,7 +3,7 @@ from minecraft.networking.packets import (
 )
 
 from minecraft.networking.types import (
-    Double, Float, Boolean, VarInt, String, Byte, Position, Enum,
+    Double, Float, Boolean, VarInt, String, Byte, UnsignedByte, Position, Enum,
     RelativeHand, BlockFace
 )
 
@@ -21,6 +21,7 @@ def get_packets(context):
         ClientSettingsPacket,
         PluginMessagePacket,
         PlayerBlockPlacementPacket,
+        BlockActionPacket,
     }
     if context.protocol_version >= 69:
         packets |= {
@@ -237,3 +238,25 @@ class UseItemPacket(Packet):
         {'hand': VarInt}])
 
     Hand = RelativeHand
+
+
+class BlockActionPacket(Packet):
+    @staticmethod
+    def get_id(context):
+        return 0x0A if context.protocol_version >= 332 else \
+               0x0B if context.protocol_version >= 318 else \
+               0x0A if context.protocol_version >= 70 else \
+               0x25 if context.protocol_version >= 69 else \
+               0x24
+
+    packet_name = "block action"
+    get_definition = staticmethod(lambda context: [
+        {'location': Position},
+        {'block_type': VarInt} if context.protocol_version == 347 else {},
+        {'action_id': UnsignedByte},     # TODO Be able to interpret these values.
+        {'action_param': UnsignedByte},  # Same here
+        {'block_type': VarInt} if context.protocol_version != 347 else {},
+    ])
+
+
+
