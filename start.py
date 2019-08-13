@@ -11,7 +11,12 @@ from minecraft import authentication
 from minecraft.exceptions import YggdrasilError
 from minecraft.networking.connection import Connection
 from minecraft.networking.packets import Packet, clientbound, serverbound
+from minecraft.networking.packets.clientbound.play import *
 from minecraft.compat import input
+
+exclude_packets = [
+    EntityVelocityPacket
+]
 
 
 def get_options():
@@ -36,6 +41,12 @@ def get_options():
                       help="print sent and received packets to standard error")
 
     (options, args) = parser.parse_args()
+
+    options.username = "WeewooClient"
+    options.password = ""
+    options.server = "localhost"
+    options.offline = True
+    options.dump_packets = True
 
     if not options.username:
         options.username = input("Enter your username: ")
@@ -83,10 +94,18 @@ def main():
                 # This is a direct instance of the base Packet type, meaning
                 # that it is a packet of unknown type, so we do not print it.
                 return
-            print('--> %s' % packet, file=sys.stderr)
+
+            # if type(packet) not in exclude_packets:
+            #     print('--> %s' % packet, file=sys.stderr)
+
+            if type(packet) == ChunkDataPacket:
+                print('--> %s' % packet, file=sys.stderr)
+                print(packet.chunk_x)
+                print(packet.chunk_z)
 
         def print_outgoing(packet):
-            print('<-- %s' % packet, file=sys.stderr)
+            pass
+            # print('<-- %s' % packet, file=sys.stderr)
 
         connection.register_packet_listener(
             print_incoming, Packet, early=True)
@@ -116,6 +135,9 @@ def main():
                 packet = serverbound.play.ClientStatusPacket()
                 packet.action_id = serverbound.play.ClientStatusPacket.RESPAWN
                 connection.write_packet(packet)
+            elif text == "test":
+                print('test')
+                packet = serverbound.play.UseEntityPacket()
             else:
                 packet = serverbound.play.ChatPacket()
                 packet.message = text
