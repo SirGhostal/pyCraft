@@ -28,12 +28,19 @@ STATE_PLAYING = 2
 
 
 class ConnectionContext(object):
-    """A ConnectionContext encapsulates the static configuration parameters
+    """
+    The ConnectionContext encapsulates the the static configuration parameters
     shared by the Connection class with other classes, such as Packet.
-    Importantly, it can be used without knowing the interface of Connection.
+    It also stores variable information which is required for parsing
+    particular packets. Importantly, ConnectionContext can be used without
+    knowing the interface of Connection.
     """
     def __init__(self, **kwds):
         self.protocol_version = kwds.get('protocol_version')
+        self.dimension = None
+        self.difficulty = None
+        self.game_mode = None
+        self.level_type = None
 
 
 class _ConnectionOptions(object):
@@ -758,6 +765,22 @@ class PlayingReactor(PacketReactor):
                 position_response.on_ground = True
                 self.connection.write_packet(position_response)
             self.connection.spawned = True
+
+        elif packet.packet_name == "server difficulty":
+            self.connection.context.difficulty = packet.difficulty
+
+        elif packet.packet_name == "respawn":
+            self.connection.context.dimension = packet.dimension
+            self.connection.context.difficulty = packet.difficulty
+            self.connection.context.game_mode = packet.game_mode
+            self.connection.context.level_type = packet.level_type
+
+        elif packet.packet_name == "join game":
+            self.connection.context.game_mode = packet.game_mode
+            self.connection.context.dimension = packet.dimension
+            self.connection.context.level_type = packet.level_type
+            if self.connection.context.protocol_version < 464:
+                self.connection.context.difficulty = packet.difficulty
 
         elif packet.packet_name == "disconnect":
             self.connection.disconnect()
