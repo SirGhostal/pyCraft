@@ -1,8 +1,11 @@
 from minecraft.networking.packets import Packet
 from minecraft.networking.types import (
     Integer, Boolean, VarInt, VarIntPrefixedByteArray, TrailingByteArray,
-    UnsignedShort, UnsignedByte, Long, Dimension, Byte, String, Short
+    UnsignedShort, UnsignedByte, Long, Dimension, Byte, String, Short, UnsignedLong
 )
+
+from collections import namedtuple, defaultdict
+import math
 
 from nbt.nbt import TAG_Compound, TAG_Byte, TAGLIST, NBTFile
 # from minecraft.networking.types.nbt import TAG_Compound
@@ -53,11 +56,11 @@ class ChunkDataPacket(Packet):
         # the chunk section at the bottom of the chunk column
         # (from y=0 to y=15).
         if self.context.protocol_version >= 70:
-            self.primary_bit_mask = VarInt.read(file_object)
+            self.mask = VarInt.read(file_object)
         elif self.context.protocol_version >= 69:
-            self.primary_bit_mask = Integer.read(file_object)
+            self.mask = Integer.read(file_object)
         else:  # Protocol Version 47
-            self.primary_bit_mask = UnsignedShort.read(file_object)
+            self.mask = UnsignedShort.read(file_object)
 
         # In protocol version 445 this is confirmed as being heightmap.
         # Compound containing one long array named MOTION_BLOCKING, which is a
@@ -71,6 +74,7 @@ class ChunkDataPacket(Packet):
 
         # TODO does this need to be self?
         self.data_size = VarInt.read(file_object) # size of data in bytes
+        print(f"Size of Data: {self.data_size} bytes.")
         self.read_chunk_column(file_object)
 
         # Number of elements in the following array
@@ -85,77 +89,97 @@ class ChunkDataPacket(Packet):
 
         print('END OF CHUNK PACKET')
 
+    def read_chunk_section_data(self, file_object):
+        # Number of longs in the following data array.
+        num_of_longs = VarInt.read(file_object)
+        print(f"num_of_longs {num_of_longs}")
+        long_array = [UnsignedLong.read(file_object)
+                        for i in range(num_of_longs)]
+        # current_long = next(long_array)
+        value_mask = (1 << self.bits_per_block) - 1
+        for y in range(16):
+            for z in range(16):
+                for x in range(16):
+                    block_number = (((y * 16) + z) * 16) + x
+                    start_long = (block_number * self.bits_per_block) // 64
+                    start_offset = (block_number * self.bits_per_block) % 64
+                    end_long = ((block_number + 1) * self.bits_per_block - 1) // 64
+
+                    print(f'startlong {start_long}')
+                    if start_long == end_long:
+                        data = (long_array[start_long] >> start_offset) & value_mask
+                    else:
+                        end_offset = 64 - start_offset
+                        data = int(long_array[start_long] >> start_offset |
+                                   long_array[end_long] << end_offset) & value_mask
+
+                    print(data)
+                    print(f"block num {block_number}")
+                    print('---------')
+
+
+
+
+
+
+
     def read_chunk_column(self, file_object):
-        # TODO What if the world is amplified? Not 16 chunks high anymore.
-        # JoinGamePacket could be help here.
+        # Determines how many bits are used to encode a block.
+        # Note that not all numbers are valid here.
+        self.bits_per_block = UnsignedByte.read(file_object)
+        print(f"BPP: {self.bits_per_block}")
+
+        # The bits per block value determines what format is used for the
+        # palette. There are two types of palettes.
+        self.palette = PaletteFactory.get_palette(self.bits_per_block)
+        self.palette.read(file_object)
+
+        print('bitty')
+        print(self.palette.bits_per_block())
+
+        for chunk_y in range(16): # chunk_height / section_height
+            if self.mask & (1 << chunk_y):
+                self.read_chunk_section_data(file_object)
+
+        Block = namedtuple('Block', 'x y z')
+
         mask = [(self.primary_bit_mask >> bit) & 1 for bit in range(
             16 - 1, -1, -1)]
-
-        self.chunk_sections = []
+        data = defaultdict()
         for chunk_y, bit in enumerate(reversed(mask)):
             print(f"{chunk_y} | {bit}")
-            section = ChunkSection(self.chunk_x, self.chunk_z, chunk_y)
             if bit:
-                section.read(file_object)
-            self.chunk_sections.append(section)
+                for y in range(16):
+                    for z in range(16):
+                        for x in range(16):
+                            block_id = UnsignedLong.read(file_object)
+                            block = Block(x, y, z)
+                            # print(f"{block} : {block_id}")
+                            data[block] = block_id
 
+
+        # Block light and Sky Light fields were removed in protocol version 441.
+        if self.context.protocol_version < 441:
+            self.block_light = []
+            for i in range(16 * 16 * 8):
+                item = Byte.read(file_object)
+                self.block_light.append(item)
+            #     print(item)
+            # print(self.block_light)
+
+            # Only if in the Overworld; half byte per block
+            if self.context.dimension is Dimension.OVERWORLD:
+                self.sky_light = []
+                for i in range(16*16*8):
+                    item = Byte.read(file_object)
+                    self.sky_light.append(item)
+                #     print(len(self.sky_light))
+                # print(self.sky_light)
 
         if self.full_chunk:
             # Read biome data.
             # Only sent if full chunk is true; 256 entries if present.
             self.biomes = [Integer.read(file_object) for i in range(256)]
-
-
-    class ChunkSection(object):
-        __slots__ = ('chunk_x', 'chunk_z', 'chunk_y', 'palette', 'data',)
-
-        def __init__(self, chunk_x, chunk_z, chunk_y):
-            self.chunk_x = chunk_x
-            self.chunk_z = chunk_z
-            self.chunk_y = chunk_y
-
-            self.palette = None
-            self.data = []
-
-
-        def read(self, file_object):
-            # Determines how many bits are used to encode a block.
-            # Note that not all numbers are valid here.
-            bits_per_block = UnsignedByte.read(file_object)
-            print(f"BPP: {bits_per_block}")
-
-            # The bits per block value determines what format is used for the
-            # palette. There are two types of palettes.
-            self.palette = PaletteFactory.get_palette(bits_per_block)
-            self.palette.read(file_object)
-
-            # Number of longs in the following data array.
-            data_length = VarInt.read(file_object)
-
-            # Compacted list of 4096 (16x16x16) indices pointing to state IDs in
-            # the Palette.
-            self.data = [Long.read(file_object) for i in range(data_length)]
-            # print(self.data)
-
-            # Block light and Sky Light fields were removed in protocol version 441.
-            if self.context.protocol_version < 441:
-                self.block_light = []
-                for i in range(16 * 16 * 8):
-                    item = Byte.read(file_object)
-                    self.block_light.append(item)
-                #     print(item)
-                # print(self.block_light)
-
-                # Only if in the Overworld; half byte per block
-                if self.context.dimension is Dimension.OVERWORLD:
-                    self.sky_light = []
-                    for i in range(16*16*8):
-                        item = Byte.read(file_object)
-                        self.sky_light.append(item)
-                    #     print(len(self.sky_light))
-                    # print(self.sky_light)
-
-            print("END OF CHUNK SECTION")
 
 
 class PaletteFactory(object):
@@ -177,16 +201,19 @@ class IndirectPalette(object):
         self.palette = {}
 
     def read(self, file_object):
-        self.length = VarInt.read(file_object)
+        length = VarInt.read(file_object)
 
         # TODO Check if this is done correctly.
         self.palette = dict((block_state_id, VarInt.read(file_object)) for
-                             block_state_id in range(self.length))
+                            block_state_id in range(length))
 
 
 class DirectPalette(object):
-    def __init__(self, bits_per_block):
-        self.bits_per_block = bits_per_block
+    def __init__(self):
+        pass
+
+    def bits_per_block(self):
+        return math.ceil(math.log2(14))
 
     def read(self, file_object):
         self.palette = Long.read(file_object)
