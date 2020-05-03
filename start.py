@@ -2,6 +2,7 @@
 
 from __future__ import print_function
 
+import asyncio
 import getpass
 import sys
 import re
@@ -59,7 +60,7 @@ def get_options():
     return options
 
 
-def main():
+async def main(loop=asyncio.get_event_loop()):
     options = get_options()
 
     if options.offline:
@@ -106,7 +107,7 @@ def main():
     connection.register_packet_listener(
         print_chat, clientbound.play.ChatMessagePacket)
 
-    connection.connect()
+    await connection.connect()
 
     while True:
         try:
@@ -115,15 +116,16 @@ def main():
                 print("respawning...")
                 packet = serverbound.play.ClientStatusPacket()
                 packet.action_id = serverbound.play.ClientStatusPacket.RESPAWN
-                connection.write_packet(packet)
+                await connection.write_packet(packet)
             else:
                 packet = serverbound.play.ChatPacket()
                 packet.message = text
-                connection.write_packet(packet)
+                await connection.write_packet(packet)
         except KeyboardInterrupt:
             print("Bye!")
             sys.exit()
 
 
 if __name__ == "__main__":
-    main()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main(loop=loop))

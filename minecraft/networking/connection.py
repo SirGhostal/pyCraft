@@ -10,6 +10,7 @@ import select
 import sys
 import json
 import re
+import asyncio
 
 from future.utils import raise_
 
@@ -56,6 +57,7 @@ class Connection(object):
         port=25565,
         auth_token=None,
         username=None,
+        loop=asyncio.get_event_loop(),  # TODO document this below
         initial_version=None,
         allowed_versions=None,
         handle_exception=None,
@@ -106,7 +108,7 @@ class Connection(object):
 
         # This lock is re-entrant because it may be acquired in a re-entrant
         # manner from within an outgoing packet listener
-        self._write_lock = RLock()
+        self._write_lock = asyncio.Lock()
 
         self.networking_thread = None
         self.new_networking_thread = None
@@ -146,6 +148,7 @@ class Connection(object):
         self.options.port = port
         self.auth_token = auth_token
         self.username = username
+        self._loop = loop
         self.connected = False
 
         self.handle_exception = handle_exception
@@ -156,24 +159,24 @@ class Connection(object):
         # it should be changed per networking state
         self.reactor = PacketReactor(self)
 
-    def _start_network_thread(self):
-        with self._write_lock:
+    async def _start_network_thread(self):
+        async with self._write_lock:
             if self.networking_thread is not None and \
                not self.networking_thread.interrupt or \
                self.new_networking_thread is not None:
                 raise InvalidState('A networking thread is already running.')
             elif self.networking_thread is None:
                 self.networking_thread = NetworkingThread(self)
-                self.networking_thread.start()
+                await self.networking_thread.start()
             else:
                 # This thread will wait until the existing thread exits, and
                 # then set 'networking_thread' to itself and
                 # 'new_networking_thread' to None.
                 self.new_networking_thread \
                     = NetworkingThread(self, previous=self.networking_thread)
-                self.new_networking_thread.start()
+                await self.new_networking_thread.start()
 
-    def write_packet(self, packet, force=False):
+    async def write_packet(self, packet, force=False):
         """Writes a packet to the server.
 
         If force is set to true, the method attempts to acquire the write lock
@@ -187,8 +190,8 @@ class Connection(object):
         """
         packet.context = self.context
         if force:
-            with self._write_lock:
-                self._write_packet(packet)
+            async with self._write_lock:
+                await self._write_packet(packet)
         else:
             self._outgoing_packet_queue.append(packet)
 
@@ -282,7 +285,7 @@ class Connection(object):
         else:
             self._exception_handlers.append((handler_func, exc_types))
 
-    def _pop_packet(self):
+    async def _pop_packet(self):
         # Pops the topmost packet off the outgoing queue and writes it out
         # through the socket
         #
@@ -294,27 +297,27 @@ class Connection(object):
         if len(self._outgoing_packet_queue) == 0:
             return False
         else:
-            self._write_packet(self._outgoing_packet_queue.popleft())
+            await self._write_packet(self._outgoing_packet_queue.popleft())
             return True
 
-    def _write_packet(self, packet):
+    async def _write_packet(self, packet):
         # Immediately writes the given packet to the network. The caller must
         # have the write lock acquired before calling this method.
         try:
             for listener in self.early_outgoing_packet_listeners:
-                listener.call_packet(packet)
+                await listener.call_packet(packet)
 
             if self.options.compression_enabled:
-                packet.write(self.socket, self.options.compression_threshold)
+                await packet.write(self.writer, self.options.compression_threshold)
             else:
-                packet.write(self.socket)
+                await packet.write(self.writer)
 
             for listener in self.outgoing_packet_listeners:
                 listener.call_packet(packet)
         except IgnorePacket:
             pass
 
-    def status(self, handle_status=None, handle_ping=False):
+    async def status(self, handle_status=None, handle_ping=False):
         """Issue a status request to the server and then disconnect.
 
         :param handle_status: a function to be called with the status
@@ -326,12 +329,12 @@ class Connection(object):
                             which prints the latency to standard outout, or
                             False, to prevent measurement of the latency.
         """
-        with self._write_lock:  # pylint: disable=not-context-manager
+        async with self._write_lock:  # pylint: disable=not-context-manager
             self._check_connection()
 
-            self._connect()
-            self._handshake(next_state=STATE_STATUS)
-            self._start_network_thread()
+            await self._connect()
+            await self._handshake(next_state=STATE_STATUS)
+            await self._start_network_thread()
 
             do_ping = handle_ping is not False
             self.reactor = StatusReactor(self, do_ping=do_ping)
@@ -347,16 +350,16 @@ class Connection(object):
                 self.reactor.handle_ping = handle_ping
 
             request_packet = serverbound.status.RequestPacket()
-            self.write_packet(request_packet)
+            await self.write_packet(request_packet)
 
-    def connect(self):
+    async def connect(self):
         """
         Attempt to begin connecting to the server.
         May safely be called multiple times after the first, i.e. to reconnect.
         """
         # Hold the lock throughout, in case connect() is called from the
         # networking thread while another connection is in progress.
-        with self._write_lock:  # pylint: disable=not-context-manager
+        async with self._write_lock:  # pylint: disable=not-context-manager
             self._check_connection()
 
             # It is important that this is set correctly even when connecting
@@ -365,26 +368,26 @@ class Connection(object):
             self.context.protocol_version = max(self.allowed_proto_versions)
 
             self.spawned = False
-            self._connect()
+            await self._connect()
             if len(self.allowed_proto_versions) == 1:
                 # There is exactly one allowed protocol version, so skip the
                 # process of determining the server's version, and immediately
                 # connect.
-                self._handshake(next_state=STATE_PLAYING)
+                await self._handshake(next_state=STATE_PLAYING)
                 login_start_packet = serverbound.login.LoginStartPacket()
                 if self.auth_token:
                     login_start_packet.name = self.auth_token.profile.name
                 else:
                     login_start_packet.name = self.username
-                self.write_packet(login_start_packet)
+                await self.write_packet(login_start_packet)
                 self.reactor = LoginReactor(self)
             else:
                 # Determine the server's protocol version by first performing a
                 # status query.
-                self._handshake(next_state=STATE_STATUS)
-                self.write_packet(serverbound.status.RequestPacket())
+                await self._handshake(next_state=STATE_STATUS)
+                await self.write_packet(serverbound.status.RequestPacket())
                 self.reactor = PlayingStatusReactor(self)
-            self._start_network_thread()
+            await self._start_network_thread()
 
     def _check_connection(self):
         if self.networking_thread is not None and \
@@ -392,7 +395,7 @@ class Connection(object):
            self.new_networking_thread is not None:
             raise InvalidState('There is an existing connection.')
 
-    def _connect(self):
+    async def _connect(self):
         # Connect a socket to the server and create a file object from the
         # socket.
         # The file object is used to read any and all data from the socket
@@ -401,8 +404,8 @@ class Connection(object):
         # the server.
         self._outgoing_packet_queue = deque()
 
-        info = socket.getaddrinfo(self.options.address, self.options.port,
-                                  0, socket.SOCK_STREAM)
+        info = await self._loop.getaddrinfo(self.options.address, self.options.port,
+                                            family=0, type=socket.SOCK_STREAM)
 
         # Prefer to use IPv4 (for backward compatibility with previous
         # versions that always resolved hostnames to IPv4 addresses),
@@ -411,24 +414,23 @@ class Connection(object):
             return 0 if ai[0] == socket.AF_INET else \
                    1 if ai[0] == socket.AF_INET6 else 2
         ai_faml, ai_type, ai_prot, _ai_cnam, ai_addr = min(info, key=key)
-
-        self.socket = socket.socket(ai_faml, ai_type, ai_prot)
-        self.socket.connect(ai_addr)
-        self.file_object = self.socket.makefile("rb", 0)
+        host, port = ai_addr
+        self.reader, self.writer = await asyncio.open_connection(host=host, port=port,
+                                                                 proto=ai_prot, family=ai_faml)
         self.options.compression_enabled = False
         self.options.compression_threshold = -1
         self.connected = True
 
-    def disconnect(self, immediate=False):
+    async def disconnect(self, immediate=False):
         """Terminate the existing server connection, if there is one.
            If 'immediate' is True, do not attempt to write any packets.
         """
         with self._write_lock:  # pylint: disable=not-context-manager
             self.connected = False
 
-            if not immediate and self.socket is not None:
+            if not immediate and any(x is not None for x in [self.reader, self.writer]):
                 # Flush any packets remaining in the queue.
-                while self._pop_packet():
+                while await self._pop_packet():
                     pass
 
             if self.networking_thread is not None:
@@ -443,16 +445,16 @@ class Connection(object):
                     self.socket.close()
                     self.socket = None
 
-    def _handshake(self, next_state=STATE_PLAYING):
+    async def _handshake(self, next_state=STATE_PLAYING):
         handshake = serverbound.handshake.HandShakePacket()
         handshake.protocol_version = self.context.protocol_version
         handshake.server_address = self.options.address
         handshake.server_port = self.options.port
         handshake.next_state = next_state
 
-        self.write_packet(handshake)
+        await self.write_packet(handshake)
 
-    def _handle_exception(self, exc, exc_info):
+    async def _handle_exception(self, exc, exc_info):
         # Call the current PacketReactor's exception handler.
         try:
             if self.reactor.handle_exception(exc, exc_info):
@@ -487,7 +489,7 @@ class Connection(object):
 
         # Record the exception and cleanly terminate the connection.
         self.exception, self.exc_info = exc, exc_info
-        self.disconnect(immediate=True)
+        await self.disconnect(immediate=True)
 
         # If allowed by the final exception handler, re-raise the exception.
         if self.handle_exception is None and not caught:
@@ -533,30 +535,30 @@ class NetworkingThread(threading.Thread):
 
         self.previous_thread = previous
 
-    def run(self):
+    async def run(self):
         try:
             if self.previous_thread is not None:
                 if self.previous_thread.is_alive():
                     self.previous_thread.join()
-                with self.connection._write_lock:
+                async with self.connection._write_lock:
                     self.connection.networking_thread = self
                     self.connection.new_networking_thread = None
-            self._run()
-            self.connection._handle_exit()
+            await self._run()
+            await self.connection._handle_exit()
         except Exception as e:
             self.interrupt = True
-            self.connection._handle_exception(e, sys.exc_info())
+            await self.connection._handle_exception(e, sys.exc_info())
         finally:
-            with self.connection._write_lock:
+            async with self.connection._write_lock:
                 self.connection.networking_thread = None
 
-    def _run(self):
+    async def _run(self):
         while not self.interrupt:
             # Attempt to write out as many as 300 packets.
             num_packets = 0
-            with self.connection._write_lock:
+            async with self.connection._write_lock:
                 try:
-                    while not self.interrupt and self.connection._pop_packet():
+                    while not self.interrupt and await self.connection._pop_packet():
                         num_packets += 1
                         if num_packets >= 300:
                             break
@@ -574,12 +576,12 @@ class NetworkingThread(threading.Thread):
 
             # Read and react to as many as 50 packets.
             while num_packets < 50 and not self.interrupt:
-                packet = self.connection.reactor.read_packet(
-                    self.connection.file_object, timeout=read_timeout)
+                packet = await self.connection.reactor.read_packet(
+                    self.connection.reader, timeout=read_timeout)
                 if not packet:
                     break
                 num_packets += 1
-                self.connection._react(packet)
+                await self.connection._react(packet)
                 read_timeout = 0
 
                 # Ignore the earlier exception if a disconnect packet is
@@ -608,10 +610,11 @@ class PacketReactor(object):
             packet.get_id(context): packet
             for packet in self.__class__.get_clientbound_packets(context)}
 
-    def read_packet(self, stream, timeout=0):
+    async def read_packet(self, stream, timeout=0):
         # Block for up to `timeout' seconds waiting for `stream' to become
         # readable, returning `None' if the timeout elapses.
-        ready_to_read = select.select([stream], [], [], timeout)[0]
+        ready_to_read = select.select([stream], [], [], timeout)[0]  # TODO this could be blocking event loop.
+                                                                     # 0 polls without any wait so might not be issue?
 
         if ready_to_read:
             length = VarInt.read(stream)
@@ -800,14 +803,14 @@ class PlayingStatusReactor(StatusReactor):
     def __init__(self, connection):
         super(PlayingStatusReactor, self).__init__(connection, do_ping=False)
 
-    def handle_status(self, status):
+    async def handle_status(self, status):
         if status == {}:
             # This can occur when we connect to a Mojang server while it is
             # still initialising, so it must not cause the client to connect
             # with the default version.
             raise IOError('Invalid server status.')
         elif 'version' not in status or 'protocol' not in status['version']:
-            return self.handle_failure()
+            return await self.handle_failure()
 
         proto = status['version']['protocol']
         if proto not in self.connection.allowed_proto_versions:
@@ -815,19 +818,19 @@ class PlayingStatusReactor(StatusReactor):
                 server_protocol=proto,
                 server_version=status['version'].get('name'))
 
-        self.handle_proto_version(proto)
+        await self.handle_proto_version(proto)
 
-    def handle_proto_version(self, proto_version):
+    async def handle_proto_version(self, proto_version):
         self.connection.allowed_proto_versions = {proto_version}
-        self.connection.connect()
+        await self.connection.connect()
 
-    def handle_failure(self):
-        self.handle_proto_version(self.connection.default_proto_version)
+    async def handle_failure(self):
+        await self.handle_proto_version(self.connection.default_proto_version)
 
-    def handle_exception(self, exc, exc_info):
+    async def handle_exception(self, exc, exc_info):
         if isinstance(exc, EOFError):
             # An exception of this type may indicate that the server does not
             # properly support status queries, so we treat it as non-fatal.
-            self.connection.disconnect(immediate=True)
-            self.handle_failure()
+            await self.connection.disconnect(immediate=True)
+            await self.handle_failure()
             return True
